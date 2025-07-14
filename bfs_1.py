@@ -5,13 +5,14 @@ import math
 # import matplotlib.pyplot as plt # Removed for PYNQ compatibility
 import time
 
-def visualize_results(image, successful_paths, broken_paths, anchor_points, break_points):
+def visualize_results(image, successful_paths, broken_paths, anchor_points, second_anchor_points, break_points):
     """
     可视化追踪结果并保存到文件。
     - image: 原始灰度图。
     - successful_paths: 追踪成功的路径列表。
     - broken_paths: 追踪失败（断线）的路径列表。
     - anchor_points: 起始锚点列表。
+    - second_anchor_points: 第二层锚点列表。
     - break_points: 断点位置列表。
     """
     # 将灰度图转换为彩色图以便标记
@@ -29,11 +30,15 @@ def visualize_results(image, successful_paths, broken_paths, anchor_points, brea
 
     # 标记起始锚点 (蓝色圆圈)
     for point in anchor_points:
-        cv2.circle(output_image, point, 5, (255, 0, 0), 1)
+        cv2.circle(output_image, point, 5, (255, 0, 0), 2)
+
+    # 新增：标记第二层锚点 (黄色圆圈)
+    for point in second_anchor_points:
+        cv2.circle(output_image, point, 5, (0, 255, 255), 1)
 
     # 标记断点 (红色X)
     for point in break_points:
-        cv2.drawMarker(output_image, point, (0, 0, 255), markerType=cv2.MARKER_TILTED_CROSS, markerSize=10, thickness=2)
+        cv2.circle(output_image, point, 5, (0, 0, 255), 1)
 
     # 将最终图像保存到文件，而不是显示它
     output_filename = "8_bfs.png"
@@ -59,18 +64,6 @@ def get_square_ring_pixels(center, r):
         pixels.append((cx + r, y))
     return pixels
 
-def judge_edge(x, y, C):
-    tmp = 220
-    if x <= tmp and y <= tmp:
-        return 0
-    if x <= tmp and y >= C - tmp:
-        return 0
-    if x >= C - tmp and y <= tmp:
-        return 0
-    if x >= C - tmp and y >= C - tmp:
-        return 0
-    return 1
-
 def judge_anchor(x, y, minx, maxx, miny, maxy): 
     if x == minx or x == maxx or y == miny or y == maxy:
         return 1
@@ -92,7 +85,7 @@ def find_anchors(image, center, fixed_radius=130, anchor_min_dist=20):
     
     if not valid_pixels_values:
         print(f"错误：在半径 {fixed_radius} 处未找到有效像素。")
-        return [], 0, 0
+        return [], [], 0, 0
 
     # 将环的平均灰度作为背景参考
     background_mean = np.mean(valid_pixels_values)
@@ -104,45 +97,49 @@ def find_anchors(image, center, fixed_radius=130, anchor_min_dist=20):
     label_path = '8.txt'
     with open(label_path, 'r') as f:
         lines = f.readlines()
-    minx = 100
-    maxx = 0
-    miny = 100
-    maxy = 0
+    
+    all_points = []
     for line in lines:
         parts = line.strip().split()
-        x = float(parts[1])
-        y = float(parts[2])
-        minx = min(x, minx)
-        maxx = max(x, maxx)
-        miny = min(y, miny)
-        maxy = max(y, maxy)
-    
-    anchors = []
-    for line in lines:
-        parts = line.strip().split()
-        x = float(parts[1])
-        y = float(parts[2])
-        if judge_anchor(x, y, minx, maxx, miny, maxy):
-            anchors.append((round(x * height), round(y * height)))
-    anchors = set(anchors)
-    
-    print(f"筛选出 {len(anchors)} 个锚点。")
-    # 返回锚点列表、用于追踪的阈值、以及所用的半径
-    return anchors, threshold, fixed_radius
+        all_points.append((float(parts[1]), float(parts[2])))
 
-def get_ring_search_points(center, min_radius, max_radius):
-    """
-    获取一个环形区域内的所有像素坐标。
-    """
-    points = []
-    cx, cy = center
-    # 遍历一个正方形边界框，然后通过距离检查来筛选出环形区域内的点
-    for x in range(cx - max_radius, cx + max_radius + 1):
-        for y in range(cy - max_radius, cy + max_radius + 1):
-            dist_sq = (x - cx)**2 + (y - cy)**2
-            if min_radius**2 <= dist_sq <= max_radius**2:
-                points.append((x, y))
-    return points
+    # 找出两层边界
+    x_coords = [p[0] for p in all_points]
+    y_coords = [p[1] for p in all_points]
+    x_coords.sort()
+    y_coords.sort()
+    x_coords = np.unique(x_coords)
+    y_coords = np.unique(y_coords)
+    
+    minxx, minx = x_coords[0], x_coords[1]
+    maxxx, maxx = x_coords[-1], x_coords[-2]
+    minyy, miny = y_coords[0], y_coords[1]
+    maxyy, maxy = y_coords[-1], y_coords[-2]
+
+    outer_anchors_norm = {p for p in all_points if judge_anchor(p[0], p[1], minxx, maxxx, minyy, maxyy)}
+    inner_anchors_norm = {p for p in all_points if judge_anchor(p[0], p[1], minx, maxx, miny, maxy)}
+
+    outer_anchors = {(round(x * width), round(y * height)) for x, y in outer_anchors_norm}
+    inner_anchors_list = [(round(x * width), round(y * height)) for x, y in inner_anchors_norm]
+
+    anchor_pairs = []
+    if not inner_anchors_list:
+        print("警告: 未找到第二层锚点。")
+        return [], [], threshold, fixed_radius
+
+    for oa in outer_anchors:
+        min_dist_sq = float('inf')
+        closest_ia = None
+        for ia in inner_anchors_list:
+            dist_sq = (oa[0] - ia[0])**2 + (oa[1] - ia[1])**2
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                closest_ia = ia
+        if closest_ia:
+            anchor_pairs.append((oa, closest_ia))
+
+    print(f"筛选出 {len(anchor_pairs)} 对锚点。")
+    return anchor_pairs, threshold, fixed_radius
 
 def get_line_pixels(p1, p2):
     """
@@ -169,163 +166,132 @@ def get_line_pixels(p1, p2):
             y0 += sy
     return points
 
-def trace_wire_bfs(image, start_point, center, die_rect, visited, threshold, start_r):
+def trace_wire_bfs(image, start_point, second_anchor, center, die_rect, visited, threshold, start_r):
     """
-    从单个锚点开始，使用一种基于优先级的贪心搜索来追踪导线。
-    - image: 灰度图。
-    - start_point: 起始锚点。
-    - center: 图像中心。
-    - die_rect: 中心Die区域的矩形 (x, y, w, h)。
-    - visited: 全局访问过的像素记录数组。
-    - threshold: 全局灰度阈值，低于此值的像素才被认为是导线的一部分。
-    - start_r: 起始环的半径。
+    从单个锚点开始，使用BFS思想来追踪导线。
     """
-    path = [start_point]
-    # 标记路径上的所有点为已访问，以避免在同一追踪中回头
-    # 使用一个临时访问集，这样每次追踪都是独立的
-    temp_visited = set([start_point])
+    # 1. 使用队列来实现BFS
+    q = deque([(start_point, [start_point])]) # (current_point, path_to_it)
+    
+    # 2. 临时访问集合，防止在单次追踪中形成环路
+    temp_visited = {start_point, second_anchor}
 
     max_path_len = start_r * 2
     
     # 搜索参数
-    search_radius_max = 6
-    search_radius_min = 3 # 避免停留在原地
-    max_brightness_increase = 20
-    max_angle_deviation = 25.0 # 角度容忍度
-    path_brightness_tolerance = 20 # 新增：路径亮度容忍度
+    search_radius_max = 20
+    search_radius_min = 3
+    max_brightness_increase = 40
+    path_brightness_tolerance = 5
+    search_sector_angle = 22.0
 
-    for _ in range(max_path_len):
-        current_point = path[-1]
+    # 用于在追踪失败时，返回找到的最长路径
+    longest_failed_path = [start_point]
+
+    # 3. BFS主循环
+    while q:
+        current_point, path = q.popleft()
         px, py = current_point
+        
+        # 更新最长失败路径
+        if len(path) > len(longest_failed_path):
+            longest_failed_path = path
 
         # 检查是否成功到达中心Die区域
         dx, dy, dw, dh = die_rect
         if dx <= px < dx + dw and dy <= py < dy + dh:
-            # 成功追踪，标记全局访问数组
-            for p in path:
-                visited[p[1], p[0]] = 1
-            return path, True, None # 路径, 成功状态, 断点
+            for p in path: visited[p[1], p[0]] = 1
+            return path, True, None
 
-        candidate_points = get_ring_search_points(current_point, search_radius_min, search_radius_max)
+        # 检查路径是否过长
+        if len(path) >= max_path_len:
+            continue
+        if visited[py, px]:
+            continue
         
-        valid_candidates = []
-        for nx, ny in candidate_points:
-            # --- 硬性约束 ---
-            # 1. 在图像范围内
-            if not (0 <= nx < image.shape[1] and 0 <= ny < image.shape[0]):
-                continue
-            # 2. 未被访问过 (在本次追踪中)
-            if (nx, ny) in temp_visited:
-                continue
-            # 3. 全局灰度低于阈值
-            if image[ny, nx] >= threshold:
-                continue
-            # 4. 局部亮度增加检查
-            if image[ny, nx] > image[py, px] + max_brightness_increase:
-                continue
-            
-            # 5. 新增：路径清空检查
-            path_is_clear = True
-            line_pixels = get_line_pixels(current_point, (nx, ny))
-            num_0 = 0
-            num_1 = 0
-            # 只检查中间点，不包括起点和终点
-            for (lx, ly) in line_pixels[1:-1]:
-                if image[ly, lx] > image[py, px] + path_brightness_tolerance or image[ly, lx] > image[ny, nx] + path_brightness_tolerance:
-                    # path_is_clear = False
-                    # break
-                    num_1 += 1
-                num_0 += 1
-            if num_0 * 0.8 < num_1:
-                path_is_clear = False
-            if not path_is_clear:
-                continue
-
-            # --- 软性约束 (用于排序) ---
-            angle_diff = 0.0
-            # 6. 角度约束 (路径长度超过10后生效)
-            if len(path) >= 4:
-                # 使用一个更稳定的历史方向向量
-                p_hist_far = path[-3]
-                p_hist_near = path[-1]
-                vec_hist = (p_hist_near[0] - p_hist_far[0], p_hist_near[1] - p_hist_far[1])
-                vec_next = (nx - p_hist_near[0], ny - p_hist_near[1])
-                
-                dot_product = vec_hist[0] * vec_next[0] + vec_hist[1] * vec_next[1]
-                mag_hist = math.sqrt(vec_hist[0]**2 + vec_hist[1]**2)
-                mag_next = math.sqrt(vec_next[0]**2 + vec_next[1]**2)
-
-                if mag_hist > 0 and mag_next > 0:
-                    cos_angle = max(-1.0, min(1.0, dot_product / (mag_hist * mag_next)))
-                    angle_diff = math.degrees(math.acos(cos_angle))
-                    if angle_diff > max_angle_deviation:
-                        continue # 角度不符合，放弃该候选点
-            
-            # 使用绝对灰度值进行排序
-            gray_value = image[ny, nx]
-            # 计算到中心的距离作为排序依据
-            dist_to_center = (nx - center[0])**2 + (ny - center[1])**2
-
-            valid_candidates.append({
-                "point": (nx, ny),
-                "gray_value": gray_value,
-                "line_std": num_1 / num_0,
-                "dist_to_center": dist_to_center
-            })
-
-        # 如果没有找到有效的候选点，则路径中断
-        if not valid_candidates:
-            for p in path:
-                visited[p[1], p[0]] = 1
-            return path, False, current_point
-
-        # 动态排序逻辑
-        if len(path) < 15:
-            # 初始阶段：优先灰度值(越小越好)，其次是离中心近
-            valid_candidates.sort(key=lambda c: (c["dist_to_center"], c["gray_value"], c["line_std"]))
+        # --- 动态定义参考向量 ---
+        if len(path) == 1:
+            vec_ref = (second_anchor[0] - start_point[0], second_anchor[1] - start_point[1])
         else:
-            # 后期阶段：优先灰度值(越小越好)，其次是角度
-            valid_candidates.sort(key=lambda c: (c["gray_value"], c["dist_to_center"]))
-        
-        best_next_point = valid_candidates[0]["point"]
-        
-        # 延伸路径
-        path.append(best_next_point)
-        temp_visited.add(best_next_point)
+            p_hist_far = path[-2]
+            vec_ref = (current_point[0] - p_hist_far[0], current_point[1] - p_hist_far[1])
 
-    # 如果循环因达到最大长度而结束，也视为中断
-    for p in path:
-        visited[p[1], p[0]] = 1
-    return path, False, path[-1]
+        # 在一个正方形区域内迭代，然后用距离和角度筛选
+        for nx in range(px - search_radius_max, px + search_radius_max + 1):
+            for ny in range(py - search_radius_max, py + search_radius_max + 1):
+                if nx == px and ny == py: continue
+
+                # --- 硬性约束 ---
+                # 1. 扇形区域约束
+                dist_sq = (nx - px)**2 + (ny - py)**2
+                if not (search_radius_min**2 <= dist_sq <= search_radius_max**2):
+                    continue
+                
+                vec_search = (nx - px, ny - py)
+                dot_product = vec_ref[0] * vec_search[0] + vec_ref[1] * vec_search[1]
+                mag_ref = math.sqrt(vec_ref[0]**2 + vec_ref[1]**2)
+                mag_search = math.sqrt(vec_search[0]**2 + vec_search[1]**2)
+                if mag_ref > 0 and mag_search > 0:
+                    cos_angle = max(-1.0, min(1.0, dot_product / (mag_ref * mag_search)))
+                    angle_from_ref = math.degrees(math.acos(cos_angle))
+                    if angle_from_ref > search_sector_angle:
+                        continue
+
+                # 2. 其他约束
+                if not (0 <= nx < image.shape[1] and 0 <= ny < image.shape[0]): continue
+                if (nx, ny) in temp_visited: continue
+                if image[ny, nx] >= threshold + 10: continue
+                if image[ny, nx] > image[py, px] + max_brightness_increase: continue
+
+                # 3. 路径清空检查
+                path_is_clear = True
+                line_pixels = get_line_pixels(current_point, (nx, ny))
+                if len(line_pixels) > 2:
+                    bright_points = 0
+                    for (lx, ly) in line_pixels[1:-1]:
+                        if image[lx, ly] > image[py, px] + path_brightness_tolerance:
+                            bright_points += 1
+                    if bright_points / (len(line_pixels) - 2) > 0.4:
+                        path_is_clear = False
+                if not path_is_clear: continue
+
+                # 4. 如果所有约束都通过，则加入队列
+                temp_visited.add((nx, ny))
+                new_path = path + [(nx, ny)]
+                q.append(((nx, ny), new_path))
+    
+    # 如果队列为空，则追踪失败
+    for p in longest_failed_path: visited[p[1], p[0]] = 1
+    return longest_failed_path, False, longest_failed_path[-1]
 
 
 def main(image_path):
     """主函数"""
-    # 加载图像
     start_time = time.time()
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         print(f"错误：无法加载图像 {image_path}")
         return
 
-    # 对比度较低，可以先进行CLAHE（限制对比度的自适应直方图均衡化）
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     image = clahe.apply(image)
     
     height, width = image.shape
     center = (width // 2, height // 2)
 
-    # 定义中心Die区域的大致范围 (需要根据实际图像微调)
-    die_size = width // 3
+    die_size = width / 2.2
     die_rect = (center[0] - die_size // 2, center[1] - die_size // 2, die_size, die_size)
 
-    # 1. 寻找锚点
-    fixed_r = int(width * 0.38) 
-    anchors, threshold, start_r = find_anchors(image, center, fixed_radius=fixed_r, anchor_min_dist=20)
+    # 1. 寻找锚点对
+    anchor_pairs, threshold, start_r = find_anchors(image, center)
 
-    if not anchors:
-        print("未能找到任何锚点，程序退出。")
+    if not anchor_pairs:
+        print("未能找到任何锚点对，程序退出。")
         return
+
+    # 为可视化和追踪准备数据
+    anchors = [p[0] for p in anchor_pairs]
+    second_anchors = [p[1] for p in anchor_pairs]
 
     # 2. 从每个锚点开始追踪
     visited = np.zeros_like(image, dtype=np.uint8)
@@ -333,15 +299,14 @@ def main(image_path):
     broken_paths = []
     break_points = []
 
-    for anchor in anchors:
+    for anchor, second_anchor in anchor_pairs:
         if visited[anchor[1], anchor[0]]:
             continue
         
         path, is_successful, break_point = trace_wire_bfs(
-            image, anchor, center, die_rect, visited, threshold, start_r
+            image, anchor, second_anchor, center, die_rect, visited, threshold, start_r
         )
         
-        # 追踪距离过短的路径可能是噪声，忽略
         if len(path) < 3:
             continue
 
@@ -355,15 +320,11 @@ def main(image_path):
     print(f"追踪完成。成功连接的导线: {len(successful_paths)}, 检测到断线: {len(broken_paths)}")
 
     # 3. 可视化结果
-    # 重新加载原始图像以获得更清晰的背景
     original_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     end_time = time.time()
-    print (end_time - start_time)
-    visualize_results(original_image, successful_paths, broken_paths, list(anchors), break_points)
+    print (f"耗时: {end_time - start_time:.2f}s")
+    visualize_results(original_image, successful_paths, broken_paths, anchors, second_anchors, break_points)
 
 if __name__ == '__main__':
-    # 请将 '8_13_b_0.jpg' 替换为您上传的图像文件的路径
-    # 如果文件在同一目录下，可以直接使用文件名
-    # image_file = '8_13_b_0.png'
     image_file = '8_mod.png'
     main(image_file)
