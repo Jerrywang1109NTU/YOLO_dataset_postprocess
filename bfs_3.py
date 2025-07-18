@@ -146,10 +146,24 @@ def get_ring_search_points(center, min_radius, max_radius):
 
 def get_line_pixels(p1, p2):
     """
-    使用Bresenham算法获取两点之间直线上的所有像素坐标。
+    使用Bresenham算法获取两点之间并延长0.5倍距离的直线上的所有像素坐标。
     """
     x0, y0 = p1
-    x1, y1 = p2
+    x1_orig, y1_orig = p2
+
+    # --- 新增：计算延长线的新终点 ---
+    # 计算方向向量
+    dx_vec = x1_orig - x0
+    dy_vec = y1_orig - y0
+    
+    # 计算延长后的终点坐标
+    x1_extended = round(x1_orig + 9 * dx_vec)
+    y1_extended = round(y1_orig + 9 * dy_vec)
+    
+    # 使用新的终点进行Bresenham算法
+    x1, y1 = x1_extended, y1_extended
+    # --- 修改结束 ---
+
     points = []
     dx = abs(x1 - x0)
     dy = -abs(y1 - y0)
@@ -169,130 +183,152 @@ def get_line_pixels(p1, p2):
             y0 += sy
     return points
 
+def reconstruct_path(predecessor, start_point, end_point):
+    """
+    通过前驱点字典回溯路径。
+    """
+    path = []
+    curr = end_point
+    while curr != start_point:
+        path.append(curr)
+        if curr not in predecessor:
+            return [] # 路径中断，无法回溯到起点
+        curr = predecessor[curr]
+    path.append(start_point)
+    path.reverse()
+    return path
+
 def trace_wire_bfs(image, start_point, center, die_rect, visited, threshold, start_r):
     """
-    从单个锚点开始，使用一种基于优先级的贪心搜索来追踪导线。
-    - image: 灰度图。
-    - start_point: 起始锚点。
-    - center: 图像中心。
-    - die_rect: 中心Die区域的矩形 (x, y, w, h)。
-    - visited: 全局访问过的像素记录数组。
-    - threshold: 全局灰度阈值，低于此值的像素才被认为是导线的一部分。
-    - start_r: 起始环的半径。
+    从单个锚点开始，使用Beam Search (基于BFS)来追踪导线。
     """
-    path = [start_point]
-    # 标记路径上的所有点为已访问，以避免在同一追踪中回头
-    # 使用一个临时访问集，这样每次追踪都是独立的
-    temp_visited = set([start_point])
-
-    max_path_len = start_r * 2
+    q = deque([start_point])
     
-    # 搜索参数
-    search_radius_max = 10
-    search_radius_min = 3 # 避免停留在原地
-    max_brightness_increase = 20
-    max_angle_deviation = 25.0 # 角度容忍度
-    path_brightness_tolerance = 20 # 新增：路径亮度容忍度
+    # 记录每个点的前驱点，用于路径重构
+    predecessor = {start_point: None}
+    
+    # 临时访问集，防止在单次追踪中形成环路
+    temp_visited = {start_point}
 
-    for _ in range(max_path_len):
-        current_point = path[-1]
+    # 搜索参数
+    search_radius_max = 6
+    search_radius_min = 3
+    max_brightness_increase = 20
+    max_angle_deviation = 20.0
+    path_brightness_tolerance = 20
+    beam_width = 2 # Beam Search的宽度
+
+    # 用于在失败时找到离中心最近的点
+    closest_point_to_center = start_point
+    min_dist_to_center = (start_point[0] - center[0])**2 + (start_point[1] - center[1])**2
+
+    while q:
+        current_point = q.popleft()
         px, py = current_point
 
         # 检查是否成功到达中心Die区域
         dx, dy, dw, dh = die_rect
         if dx <= px < dx + dw and dy <= py < dy + dh:
-            # 成功追踪，标记全局访问数组
-            for p in path:
-                visited[p[1], p[0]] = 1
-            return path, True, None # 路径, 成功状态, 断点
+            path = reconstruct_path(predecessor, start_point, current_point)
+            for p in path: visited[p[1], p[0]] = 1
+            return path, True, None
 
         candidate_points = get_ring_search_points(current_point, search_radius_min, search_radius_max)
         
         valid_candidates = []
         for nx, ny in candidate_points:
             # --- 硬性约束 ---
-            # 1. 在图像范围内
-            if not (0 <= nx < image.shape[1] and 0 <= ny < image.shape[0]):
+            if not (0 <= nx < image.shape[1] and 0 <= ny < image.shape[0]): continue
+            
+            # 1. 全局访问检查：确保此点未被任何之前的路径占用
+            if visited[ny, nx] == 1:
                 continue
-            # 2. 未被访问过 (在本次追踪中)
+
+            # 2. 本次追踪访问检查：防止在当前路径中形成环路
             if (nx, ny) in temp_visited:
                 continue
-            # 3. 全局灰度低于阈值
-            if image[ny, nx] >= threshold:
-                continue
-            # 4. 局部亮度增加检查
-            if image[ny, nx] > image[py, px] + max_brightness_increase:
-                continue
             
-            # 5. 新增：路径清空检查
+            # 3. 全局灰度低于阈值
+            if image[ny, nx] >= threshold: continue
+            
+            # 4. 局部亮度增加检查
+            if image[ny, nx] > image[py, px] + max_brightness_increase: continue
+            
             path_is_clear = True
             line_pixels = get_line_pixels(current_point, (nx, ny))
-            num_0 = float("inf")
+            num_0 = image[ny, nx]
             num_1 = 0
-            # 只检查中间点，不包括起点和终点
+            num_2 = 0
             for (lx, ly) in line_pixels[1:-1]:
-                if image[ly, lx] > image[py, px] + path_brightness_tolerance or image[ly, lx] > image[ny, nx] + path_brightness_tolerance:
-                    # path_is_clear = False
-                    # break
-                    num_1 += image[ly, lx]
+                num_2 += 1
+                num_1 += image[ly, lx]
                 num_0 = min(num_0, image[ly, lx])
-
+            num_1 += image[ny, nx]
+            num_2 += 1
+            num_1 /= num_2
+            
             # --- 软性约束 (用于排序) ---
+            path = reconstruct_path(predecessor, start_point, current_point)
             angle_diff = 0.0
-            # 6. 角度约束 (路径长度超过10后生效)
-            if len(path) >= 4:
-                # 使用一个更稳定的历史方向向量
+            if len(path) >= 5:
                 p_hist_far = path[-3]
+                p_hist_mid = path[-2]
                 p_hist_near = path[-1]
-                vec_hist = (p_hist_near[0] - p_hist_far[0], p_hist_near[1] - p_hist_far[1])
-                vec_next = (nx - p_hist_near[0], ny - p_hist_near[1])
-                
+                vec_hist = (p_hist_mid[0] - p_hist_far[0], p_hist_mid[1] - p_hist_far[1])
+                vec_next_0 = (p_hist_near[0] - p_hist_mid[0], p_hist_near[1] - p_hist_mid[1])
+                vec_next_1 = (nx - p_hist_near[0], ny - p_hist_near[1])
+                vec_next = (vec_next_0[0] + vec_next_1[0], vec_next_0[1] + vec_next_1[1])
                 dot_product = vec_hist[0] * vec_next[0] + vec_hist[1] * vec_next[1]
                 mag_hist = math.sqrt(vec_hist[0]**2 + vec_hist[1]**2)
                 mag_next = math.sqrt(vec_next[0]**2 + vec_next[1]**2)
-
                 if mag_hist > 0 and mag_next > 0:
                     cos_angle = max(-1.0, min(1.0, dot_product / (mag_hist * mag_next)))
                     angle_diff = math.degrees(math.acos(cos_angle))
-                    if angle_diff > max_angle_deviation:
-                        continue # 角度不符合，放弃该候选点
+                    if angle_diff > max_angle_deviation: continue
             
-            # 使用绝对灰度值进行排序
             gray_value = image[ny, nx]
-            # 计算到中心的距离作为排序依据
             dist_to_center = (nx - center[0])**2 + (ny - center[1])**2
-
             valid_candidates.append({
                 "point": (nx, ny),
                 "gray_value": gray_value,
                 "line_min": num_0,
+                "line_sum":num_1,
+                "angle_diff":angle_diff, 
                 "dist_to_center": dist_to_center
             })
 
-        # 如果没有找到有效的候选点，则路径中断
         if not valid_candidates:
-            for p in path:
-                visited[p[1], p[0]] = 1
-            return path, False, current_point
+            continue
 
         # 动态排序逻辑
-        if len(path) < 13:
-            # 初始阶段：优先灰度值(越小越好)，其次是离中心近
-            valid_candidates.sort(key=lambda c: (c["dist_to_center"], c["gray_value"], c["line_min"]))
+        if len(path) < 5:
+            valid_candidates.sort(key=lambda c: (c["dist_to_center"], c["line_sum"], c["line_min"]))
+        elif len(path) < 10:
+            valid_candidates.sort(key=lambda c: (c["line_sum"]))
         else:
-            # 后期阶段：优先灰度值(越小越好)，其次是角度
-            valid_candidates.sort(key=lambda c: (c["gray_value"], c["line_min"], c["dist_to_center"]))
+            valid_candidates.sort(key=lambda c: (c["line_sum"]))
         
-        best_next_point = valid_candidates[0]["point"]
-        
-        # 延伸路径
-        path.append(best_next_point)
-        temp_visited.add(best_next_point)
+        # 将前N个最佳候选点加入队列
+        top_candidates = valid_candidates[:beam_width]
+        for cand in top_candidates:
+            next_point = cand["point"]
+            if next_point not in temp_visited:
+                temp_visited.add(next_point)
+                predecessor[next_point] = current_point
+                q.append(next_point)
 
-    # 如果循环因达到最大长度而结束，也视为中断
-    for p in path:
-        visited[p[1], p[0]] = 1
-    return path, False, path[-1]
+                # 更新离中心最近的点
+                dist_sq = cand["dist_to_center"]
+                if dist_sq < min_dist_to_center:
+                    min_dist_to_center = dist_sq
+                    closest_point_to_center = next_point
+    
+    # 如果队列为空，则追踪失败
+    failed_path = reconstruct_path(predecessor, start_point, closest_point_to_center)
+    for p in failed_path:
+        if 0 <= p[1] < image.shape[0] and 0 <= p[0] < image.shape[1]:
+            visited[p[1], p[0]] = 1
+    return failed_path, False, closest_point_to_center
 
 
 def main(image_path):
@@ -328,11 +364,12 @@ def main(image_path):
     successful_paths = []
     broken_paths = []
     break_points = []
-
+    numx = 0
     for anchor in anchors:
         if visited[anchor[1], anchor[0]]:
             continue
-        
+        numx += 1
+        print(numx)
         path, is_successful, break_point = trace_wire_bfs(
             image, anchor, center, die_rect, visited, threshold, start_r
         )
@@ -348,14 +385,14 @@ def main(image_path):
             if break_point:
                 break_points.append(break_point)
 
-    print(f"追踪完成。成功连接的导线: {len(successful_paths)}, 检测到断线: {len(broken_paths)}")
+        print(f"追踪完成。成功连接的导线: {len(successful_paths)}, 检测到断线: {len(broken_paths)}")
 
-    # 3. 可视化结果
-    # 重新加载原始图像以获得更清晰的背景
-    original_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    end_time = time.time()
-    print (end_time - start_time)
-    visualize_results(original_image, successful_paths, broken_paths, list(anchors), break_points)
+        # 3. 可视化结果
+        # 重新加载原始图像以获得更清晰的背景
+        original_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        end_time = time.time()
+        print (end_time - start_time)
+        visualize_results(original_image, successful_paths, broken_paths, list(anchors), break_points)
 
 if __name__ == '__main__':
     # 请将 '8_13_b_0.jpg' 替换为您上传的图像文件的路径
@@ -363,6 +400,3 @@ if __name__ == '__main__':
     # image_file = '8_13_b_0.png'
     image_file = '8_mod.png'
     main(image_file)
-
-# benchmark for bfs search method
-# this method can trace one wire successfully
